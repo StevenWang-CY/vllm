@@ -454,6 +454,11 @@ class Scheduler(SchedulerInterface):
         # A priority-0 request whose CPU-tier hit extends its GPU hit by at most
         # recompute_tokens recomputes the extension rather than load it.
         self.recompute_tokens = make_room["recompute_tokens"]
+        # A call's turn announced before it arrives: with the budget cap, a
+        # priority-0 request for one token holds lower-priority prefill back for
+        # hint_hold_ms from its arrival, until when _hint_until stands.
+        self.hint_hold_s = make_room["hint_hold_ms"] / 1e3
+        self._hint_until = 0.0
         self._retained: list[tuple[float, KVCacheBlock, list[KVCacheBlock]]] = []
         # The admissions the budget cap held back, for make-room's log line
         # beside the counts above (see _make_room_log).
@@ -2827,6 +2832,11 @@ class Scheduler(SchedulerInterface):
                 request.streaming_queue = deque()
             self._enqueue_waiting_request(request)
             self.requests[request.request_id] = request
+            if self.hint_hold_s and request.priority == 0 and request.max_tokens == 1:
+                # A realtime request for one token announces a call's turn: the
+                # voice worker sends one when the user stops speaking, a speech
+                # recognition's round trip before the turn's own request.
+                self._hint_until = time.monotonic() + self.hint_hold_s
             if self.spec_decode_metrics_level != "none":
                 request.spec_decode_metrics = RequestSpecDecodeMetrics.new(
                     self.num_spec_tokens
@@ -3302,6 +3312,7 @@ class Scheduler(SchedulerInterface):
             "retain_tokens": 0,
             "retain_s": 30,
             "recompute_tokens": 0,
+            "hint_hold_ms": 0,
         }
         if not isinstance(make_room, dict):
             raise ValueError(f"make_room must be a table, not {make_room!r}")
@@ -3337,6 +3348,7 @@ class Scheduler(SchedulerInterface):
             or switches["reserve_tokens"]
             or switches["retain_tokens"]
             or switches["recompute_tokens"]
+            or switches["hint_hold_ms"]
         ):
             raise ValueError("make_room needs --scheduling-policy priority")
         return switches
@@ -3534,7 +3546,8 @@ class Scheduler(SchedulerInterface):
         in this step but only on budget the running loop leaves, and the ones
         whose load is in flight, for its first
         `priority_prefill_budget_cap_tokens` steps: a stuck load holds nothing
-        after those."""
+        after those; and priority 0 for hint_hold_ms after a call's turn is
+        announced (a priority-0 request for one token)."""
         if not self.priority_prefill_budget_cap:
             return None
         # Each load in flight and the step it was first seen in; the loads that
@@ -3562,6 +3575,9 @@ class Scheduler(SchedulerInterface):
                 for req, start in self._load_hold_start.items()
                 if self.current_step - start < self.priority_prefill_budget_cap_tokens
             )
+        if self._hint_until and time.monotonic() < self._hint_until:
+            # A call's turn is announced and its request on its way.
+            priorities.append(0)
         return min(priorities, default=None)
 
     def _first_tokens_priority(

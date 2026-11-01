@@ -3436,12 +3436,15 @@ class Scheduler(SchedulerInterface):
         )
         if totals != self._make_room_logged:
             self._make_room_logged = totals
-            logger.info(
+            line = (
                 "make-room: budget cap held lower-priority prefill back in %d "
                 "steps (%d prefill tokens and %d admissions, summed over the "
-                "steps); %d preemptions to make room; %d turns announced",
-                *totals,
+                "steps); %d preemptions to make room"
             )
+            if self.hint_hold_s:
+                logger.info(line + "; %d turns announced", *totals)
+            else:  # as before the hints, for the line's readers
+                logger.info(line, *totals[:-1])
 
     def _peek_make_room_request(self, defer_prefills: bool) -> Request | None:
         """The waiting request of the highest priority that the waiting loop can

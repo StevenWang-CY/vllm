@@ -434,6 +434,25 @@ class Scheduler(SchedulerInterface):
                 "make_room.reserve_tokens leaves no room for a request of "
                 "max_model_len tokens"
             )
+        # Realtime prefixes kept on the GPU between turns: a finished request of
+        # priority 0 keeps one more reference on its full blocks, so that its
+        # conversation's next turn finds the prefix there, not in the CPU tier or
+        # nowhere. Each retention holds its blocks, its anchor (the last full
+        # block of its prompt, which the next turn's prefix hit covers) and the
+        # time it began; it ends when a later retention holds its anchor or after
+        # retain_s, and all of them keep within retain_tokens.
+        self.retain_blocks = cdiv(make_room["retain_tokens"], block_size)
+        if self.retain_blocks and (
+            self.retain_blocks + self.reserve_blocks + num_max_len_blocks
+            >= num_gpu_blocks
+        ):
+            raise ValueError(
+                "make_room.retain_tokens leaves no room for a request of "
+                "max_model_len tokens"
+            )
+        self.retain_s = make_room["retain_s"]
+        self._retained: list[tuple[float, KVCacheBlock, list[KVCacheBlock]]] = []
+        self._num_retained_blocks = 0
         # The admissions the budget cap held back, for make-room's log line
         # beside the counts above (see _make_room_log).
         self.make_room_held_admissions = 0
@@ -725,6 +744,8 @@ class Scheduler(SchedulerInterface):
         # Priority policy: make room for the waiting request of the highest
         # priority first, so that no request scheduled in this step is preempted.
         self._make_room_log()
+        if self._retained:
+            self._expire_retentions()
         make_room_req = self._peek_make_room_request(defer_prefills)
         make_room_hit = (
             None if make_room_req is None else self._local_prefix_hit(make_room_req)
@@ -2926,6 +2947,8 @@ class Scheduler(SchedulerInterface):
         """Free the request's KV blocks, deferring the return to the block
         pool when an in-flight GPU step may still write them.
         """
+        if self.retain_blocks and request.priority == 0:
+            self._retain(request)
         if self._request_blocks_can_be_freed(request):
             self.kv_cache_manager.free(request)
             return
@@ -3024,6 +3047,9 @@ class Scheduler(SchedulerInterface):
             # persistent batch in the model runner.
             self.prev_step_scheduled_req_ids.clear()
 
+        # A reset needs every block free: the retentions end first.
+        while self._retained:
+            self._end_retention(0)
         reset_successful = self.kv_cache_manager.reset_prefix_cache()
         if reset_running_requests and not reset_successful:
             raise RuntimeError(
@@ -3258,6 +3284,8 @@ class Scheduler(SchedulerInterface):
             "budget_cap": False,
             "budget_cap_tokens": 16,
             "reserve_tokens": 0,
+            "retain_tokens": 0,
+            "retain_s": 30,
         }
         if not isinstance(make_room, dict):
             raise ValueError(f"make_room must be a table, not {make_room!r}")
@@ -3272,7 +3300,7 @@ class Scheduler(SchedulerInterface):
                     )
                 switches[key] = flag
             elif key in switches:
-                least = 1 if key == "budget_cap_tokens" else 0
+                least = 1 if key in ("budget_cap_tokens", "retain_s") else 0
                 if (
                     isinstance(value, bool)
                     or not isinstance(value, int)
@@ -3291,9 +3319,63 @@ class Scheduler(SchedulerInterface):
             switches["max_preemptions_per_step"]
             or switches["budget_cap"]
             or switches["reserve_tokens"]
+            or switches["retain_tokens"]
         ):
             raise ValueError("make_room needs --scheduling-policy priority")
         return switches
+
+    def _retain(self, request: Request) -> None:
+        """Keep the finished priority-0 `request`'s full blocks on the GPU, one
+        more reference each, so that its conversation's next turn finds its
+        prefix there. A retention this one holds the anchor of is the same
+        conversation's previous turn, and ends. A turn that does not fit in the
+        room the other conversations' retentions leave within retain_tokens is
+        not retained: theirs are the conversations that speak next."""
+        groups = self.kv_cache_manager.get_blocks(request.request_id).blocks
+        num_prompt_blocks = request.num_prompt_tokens // self.block_size
+        if not groups or not num_prompt_blocks or len(groups[0]) < num_prompt_blocks:
+            return
+        anchor = groups[0][num_prompt_blocks - 1]
+        if anchor.block_hash is None or anchor.is_null:
+            return
+        blocks = [
+            block
+            for group in groups
+            for block in group
+            if block.block_hash is not None and not block.is_null
+        ]
+        held = {id(block) for block in blocks}
+        previous = [
+            i for i, (_, other, _) in enumerate(self._retained) if id(other) in held
+        ]
+        others = self._num_retained_blocks - sum(
+            len(self._retained[i][2]) for i in previous
+        )
+        fits = others + len(blocks) <= self.retain_blocks
+        if fits:
+            self.kv_cache_manager.block_pool.touch(blocks)
+        for i in reversed(previous):
+            self._end_retention(i)
+        if fits:
+            self._retained.append((time.monotonic(), anchor, blocks))
+            self._num_retained_blocks += len(blocks)
+
+    def _end_retention(self, index: int) -> None:
+        """End the retention at `index`: its blocks lose the reference it held,
+        in reverse so that the tail is evicted first, at once though a step be
+        in flight. They are full blocks, written before their request
+        finished, and one whose last holder it was is in no scheduled request's
+        blocks, so no step in flight reads it."""
+        _, _, blocks = self._retained.pop(index)
+        self._num_retained_blocks -= len(blocks)
+        self.kv_cache_manager.block_pool.free_blocks(reversed(blocks))
+
+    def _expire_retentions(self) -> None:
+        """End the retentions older than retain_s: their conversation has had no
+        turn since, so it has ended or paused."""
+        horizon = time.monotonic() - self.retain_s
+        while self._retained and self._retained[0][0] <= horizon:
+            self._end_retention(0)
 
     def _make_room_log(self) -> None:
         """Log make-room's totals, at most every 10 s and when they moved: the

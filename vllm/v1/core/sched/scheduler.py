@@ -514,6 +514,7 @@ class Scheduler(SchedulerInterface):
         # hint_hold_ms from its arrival, until when _hint_until stands.
         self.hint_hold_s = make_room["hint_hold_ms"] / 1e3
         self._hint_until = 0.0
+        self._num_hints = 0
         self._retained: list[tuple[float, KVCacheBlock, list[KVCacheBlock]]] = []
         # The admissions the budget cap held back, for make-room's log line
         # beside the counts above (see _make_room_log).
@@ -3152,6 +3153,7 @@ class Scheduler(SchedulerInterface):
                 # voice worker sends one when the user stops speaking, a speech
                 # recognition's round trip before the turn's own request.
                 self._hint_until = time.monotonic() + self.hint_hold_s
+                self._num_hints += 1
             if self.spec_decode_metrics_level != "none":
                 request.spec_decode_metrics = RequestSpecDecodeMetrics.new(
                     self.num_spec_tokens
@@ -3763,8 +3765,8 @@ class Scheduler(SchedulerInterface):
         """Log make-room's totals, at most every 10 s and when they moved: the
         steps in which the budget cap held lower-priority prefill back, the
         prefill tokens and admissions it held back in them, summed over the
-        steps, and the requests make-room preempted, apart from the running
-        loop's preemptions."""
+        steps, the requests make-room preempted, apart from the running
+        loop's preemptions, and the calls' turns announced to it."""
         now = time.monotonic()
         if now - self._make_room_log_time < 10:
             return
@@ -3774,13 +3776,14 @@ class Scheduler(SchedulerInterface):
             self._num_prefill_held_tokens,
             self.make_room_held_admissions,
             self._num_priority_preemptions,
+            self._num_hints,
         )
         if totals != self._make_room_logged:
             self._make_room_logged = totals
             logger.info(
                 "make-room: budget cap held lower-priority prefill back in %d "
                 "steps (%d prefill tokens and %d admissions, summed over the "
-                "steps); %d preemptions to make room",
+                "steps); %d preemptions to make room; %d turns announced",
                 *totals,
             )
 

@@ -506,6 +506,9 @@ class Scheduler(SchedulerInterface):
                 "max_model_len tokens"
             )
         self.retain_s = make_room["retain_s"]
+        # A priority-0 request whose CPU-tier hit extends its GPU hit by at most
+        # recompute_tokens recomputes the extension rather than load it.
+        self.recompute_tokens = make_room["recompute_tokens"]
         self._retained: list[tuple[float, KVCacheBlock, list[KVCacheBlock]]] = []
         # The admissions the budget cap held back, for make-room's log line
         # beside the counts above (see _make_room_log).
@@ -1372,6 +1375,19 @@ class Scheduler(SchedulerInterface):
                                 )
                             )
                             load_kv_async &= num_external_computed_tokens > 0
+
+                        if (
+                            load_kv_async
+                            and request.priority == 0
+                            and 0 < num_external_computed_tokens <= self.recompute_tokens
+                        ):
+                            # A load costs a request two or three step
+                            # boundaries however few its tokens: a realtime
+                            # request recomputes so short an extension of its
+                            # local hit (the block an EAGLE drafter drops from
+                            # every hit, a retention's tail) in its own step.
+                            num_external_computed_tokens = 0
+                            load_kv_async = False
 
                         if hit_diverged and num_external_computed_tokens == 0:
                             # No external tokens back the deeper local hit, so its
@@ -3629,6 +3645,7 @@ class Scheduler(SchedulerInterface):
             "reserve_tokens": 0,
             "retain_tokens": 0,
             "retain_s": 30,
+            "recompute_tokens": 0,
         }
         if not isinstance(make_room, dict):
             raise ValueError(f"make_room must be a table, not {make_room!r}")
@@ -3663,6 +3680,7 @@ class Scheduler(SchedulerInterface):
             or switches["budget_cap"]
             or switches["reserve_tokens"]
             or switches["retain_tokens"]
+            or switches["recompute_tokens"]
         ):
             raise ValueError("make_room needs --scheduling-policy priority")
         return switches

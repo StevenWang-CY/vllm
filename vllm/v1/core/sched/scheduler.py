@@ -511,6 +511,11 @@ class Scheduler(SchedulerInterface):
         # A priority-0 request whose CPU-tier hit extends its GPU hit by at most
         # recompute_tokens recomputes the extension rather than load it.
         self.recompute_tokens = make_room["recompute_tokens"]
+        # A call's turn announced before it arrives: with the budget cap, a
+        # priority-0 request for one token holds lower-priority prefill back for
+        # hint_hold_ms from its arrival, until when _hint_until stands.
+        self.hint_hold_s = make_room["hint_hold_ms"] / 1e3
+        self._hint_until = 0.0
         self._retained: list[tuple[float, KVCacheBlock, list[KVCacheBlock]]] = []
         # The admissions the budget cap held back, for make-room's log line
         # beside the counts above (see _make_room_log).
@@ -891,7 +896,13 @@ class Scheduler(SchedulerInterface):
             None if make_room_req is None else self._local_prefix_hit(make_room_req)
         )
         holders = self._first_tokens_holders()
-        hold_priority = min((req.priority for req in holders), default=None)
+        # The priorities prefill is held for: the holders', and 0 for
+        # hint_hold_ms after a call's turn is announced (a priority-0 request
+        # for one token), while the turn's request is on its way.
+        hold_priorities = [req.priority for req in holders]
+        if self._hint_until and time.monotonic() < self._hint_until:
+            hold_priorities.append(0)
+        hold_priority = min(hold_priorities, default=None)
         make_room_preempted_reqs: set[Request] = set()
         if (
             make_room_req is not None
@@ -920,7 +931,8 @@ class Scheduler(SchedulerInterface):
             and self._waiting_request_holds(make_room_req, make_room_hit)
         ):
             holders.append(make_room_req)
-        first_tokens_priority = min((req.priority for req in holders), default=None)
+            hold_priorities.append(make_room_req.priority)
+        first_tokens_priority = min(hold_priorities, default=None)
         # A prefill midway through an encoder input keeps that input's encoder
         # output cached, and only its progress frees the space: it goes on while
         # a request it is held for has encoder inputs to schedule.
@@ -3203,6 +3215,11 @@ class Scheduler(SchedulerInterface):
                 request.streaming_queue = deque()
             self._enqueue_waiting_request(request)
             self.requests[request.request_id] = request
+            if self.hint_hold_s and request.priority == 0 and request.max_tokens == 1:
+                # A realtime request for one token announces a call's turn: the
+                # voice worker sends one when the user stops speaking, a speech
+                # recognition's round trip before the turn's own request.
+                self._hint_until = time.monotonic() + self.hint_hold_s
             if self.spec_decode_metrics_level != "none":
                 request.spec_decode_metrics = RequestSpecDecodeMetrics.new(
                     self.num_spec_tokens
@@ -3707,6 +3724,7 @@ class Scheduler(SchedulerInterface):
             "retain_tokens": 0,
             "retain_s": 30,
             "recompute_tokens": 0,
+            "hint_hold_ms": 0,
         }
         if not isinstance(make_room, dict):
             raise ValueError(f"make_room must be a table, not {make_room!r}")
@@ -3742,6 +3760,7 @@ class Scheduler(SchedulerInterface):
             or switches["reserve_tokens"]
             or switches["retain_tokens"]
             or switches["recompute_tokens"]
+            or switches["hint_hold_ms"]
         ):
             raise ValueError("make_room needs --scheduling-policy priority")
         return switches
@@ -3940,7 +3959,9 @@ class Scheduler(SchedulerInterface):
         or in flight for fewer than that many steps (a stuck load stops
         holding). What such a request waits for may be what it holds back, so
         each of them but a load in flight also stops holding after that many
-        steps in which it is scheduled nothing: _holds_while_scheduled."""
+        steps in which it is scheduled nothing: _holds_while_scheduled. A call's
+        announced turn holds as priority 0 beside them: see _hint_until in
+        schedule()."""
         if not self.priority_prefill_budget_cap:
             return []
         # Each in-flight load and the step it was first seen in; finished or

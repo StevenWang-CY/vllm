@@ -495,7 +495,7 @@ class Scheduler(SchedulerInterface):
         # nowhere. Each retention holds its blocks, its anchor (the last full
         # block of its prompt, which the next turn's prefix hit covers) and the
         # time it began; it ends when a later retention holds its anchor or after
-        # retain_s, and all of them keep within retain_tokens.
+        # retain_s, and the distinct blocks they hold keep within retain_tokens.
         self.retain_blocks = cdiv(make_room["retain_tokens"], block_size)
         if self.retain_blocks and (
             self.retain_blocks + self.reserve_blocks + num_max_len_blocks
@@ -507,7 +507,6 @@ class Scheduler(SchedulerInterface):
             )
         self.retain_s = make_room["retain_s"]
         self._retained: list[tuple[float, KVCacheBlock, list[KVCacheBlock]]] = []
-        self._num_retained_blocks = 0
         # The admissions the budget cap held back, for make-room's log line
         # beside the counts above (see _make_room_log).
         self.make_room_held_admissions = 0
@@ -3674,7 +3673,10 @@ class Scheduler(SchedulerInterface):
         prefix there. A retention this one holds the anchor of is the same
         conversation's previous turn, and ends. A turn that does not fit in the
         room the other conversations' retentions leave within retain_tokens is
-        not retained: theirs are the conversations that speak next."""
+        not retained: theirs are the conversations that speak next. Room is
+        counted in distinct blocks: retentions that share blocks (a turn and
+        the preemptive request it replaced, which share their history) take the
+        room of their union."""
         groups = self.kv_cache_manager.get_blocks(request.request_id).blocks
         num_prompt_blocks = request.num_prompt_tokens // self.block_size
         if not groups or not num_prompt_blocks or len(groups[0]) < num_prompt_blocks:
@@ -3692,17 +3694,24 @@ class Scheduler(SchedulerInterface):
         previous = [
             i for i, (_, other, _) in enumerate(self._retained) if id(other) in held
         ]
-        others = self._num_retained_blocks - sum(
-            len(self._retained[i][2]) for i in previous
-        )
-        fits = others + len(blocks) <= self.retain_blocks
+        kept = {
+            id(block)
+            for i, (_, _, other_blocks) in enumerate(self._retained)
+            if i not in previous
+            for block in other_blocks
+        }
+        fits = len(kept | held) <= self.retain_blocks
         if fits:
             self.kv_cache_manager.block_pool.touch(blocks)
         for i in reversed(previous):
             self._end_retention(i)
         if fits:
             self._retained.append((time.monotonic(), anchor, blocks))
-            self._num_retained_blocks += len(blocks)
+
+    @property
+    def _num_retained_blocks(self) -> int:
+        """The distinct blocks the retentions hold."""
+        return len({id(block) for _, _, blocks in self._retained for block in blocks})
 
     def _end_retention(self, index: int) -> None:
         """End the retention at `index`: its blocks lose the reference it held,
@@ -3711,7 +3720,6 @@ class Scheduler(SchedulerInterface):
         finished, and one whose last holder it was is in no scheduled request's
         blocks, so no step in flight reads it."""
         _, _, blocks = self._retained.pop(index)
-        self._num_retained_blocks -= len(blocks)
         self.kv_cache_manager.block_pool.free_blocks(reversed(blocks))
 
     def _expire_retentions(self) -> None:

@@ -419,6 +419,11 @@ class Scheduler(SchedulerInterface):
         # free only the reservations of in-flight prefills of its priority or a
         # higher one: see _reservation_priority.
         self.take_reservations = make_room["take_reservations"]
+        # With the budget cap, lower-priority decodes sit out the steps of a
+        # running request's first decode_hold_tokens output tokens: see
+        # _decode_hold_priority. The decode slots held, for the log line.
+        self.decode_hold_tokens = make_room["decode_hold_tokens"]
+        self._num_decodes_held = 0
         # The step in which each in-flight KV load was first seen, and the steps
         # each waiting request has held lower-priority prefill back: either
         # holds for priority_prefill_budget_cap_tokens steps only.
@@ -813,6 +818,9 @@ class Scheduler(SchedulerInterface):
             ),
             default=None,
         )
+        # Decodes of a lower priority sit out the steps of a running request's
+        # first decode_hold_tokens tokens.
+        decode_hold_priority = self._decode_hold_priority()
 
         # First, schedule the RUNNING requests.
         req_index = 0
@@ -873,6 +881,18 @@ class Scheduler(SchedulerInterface):
                 self._count_prefill_hold(
                     num_held_tokens, min(token_budget, input_budget - draft_slots)
                 )
+                req_index += 1
+                continue
+
+            if (
+                decode_hold_priority is not None
+                and not request.is_prefill_chunk
+                and request.priority > decode_hold_priority
+            ):
+                # A request of a higher priority decodes its first tokens: its
+                # steps carry no lower-priority decode, whose long context would
+                # slow each of them.
+                self._num_decodes_held += 1
                 req_index += 1
                 continue
 
@@ -3404,6 +3424,7 @@ class Scheduler(SchedulerInterface):
             "recompute_tokens": 0,
             "hint_hold_ms": 0,
             "take_reservations": False,
+            "decode_hold_tokens": 0,
         }
         if not isinstance(make_room, dict):
             raise ValueError(f"make_room must be a table, not {make_room!r}")
@@ -3441,12 +3462,18 @@ class Scheduler(SchedulerInterface):
             or switches["recompute_tokens"]
             or switches["hint_hold_ms"]
             or switches["take_reservations"]
+            or switches["decode_hold_tokens"]
         ):
             raise ValueError("make_room needs --scheduling-policy priority")
         if switches["take_reservations"] and not switches["budget_cap"]:
             raise ValueError(
                 "make_room.take_reservations needs make_room.budget_cap, which "
                 "holds the lower priorities' prefill back meanwhile"
+            )
+        if switches["decode_hold_tokens"] and not switches["budget_cap"]:
+            raise ValueError(
+                "make_room.decode_hold_tokens needs make_room.budget_cap, whose "
+                "first tokens it extends to the lower priorities' decodes"
             )
         return switches
 
@@ -3528,6 +3555,7 @@ class Scheduler(SchedulerInterface):
             self.make_room_held_admissions,
             self._num_priority_preemptions,
             self._num_hints,
+            self._num_decodes_held,
         )
         if totals != self._make_room_logged:
             self._make_room_logged = totals
@@ -3536,10 +3564,16 @@ class Scheduler(SchedulerInterface):
                 "steps (%d prefill tokens and %d admissions, summed over the "
                 "steps); %d preemptions to make room"
             )
+            # As before the hints and the decode hold when they are off, for
+            # the line's readers.
+            args = list(totals[:4])
             if self.hint_hold_s:
-                logger.info(line + "; %d turns announced", *totals)
-            else:  # as before the hints, for the line's readers
-                logger.info(line, *totals[:-1])
+                line += "; %d turns announced"
+                args.append(totals[4])
+            if self.decode_hold_tokens:
+                line += "; %d decodes held"
+                args.append(totals[5])
+            logger.info(line, *args)
 
     def _peek_make_room_request(self, defer_prefills: bool) -> Request | None:
         """The highest-priority waiting request that the waiting loop can
@@ -3687,6 +3721,26 @@ class Scheduler(SchedulerInterface):
                 if self.current_step - start < self.priority_prefill_budget_cap_tokens
             )
         return holders
+
+    def _decode_hold_priority(self) -> int | None:
+        """With decode_hold_tokens, the highest priority among the running
+        requests whose first decode_hold_tokens output tokens are due, a step in
+        flight counted as one, as the budget cap counts it: the decodes of a lower
+        priority sit out those steps. A call's first sentence then decodes in
+        steps that read no agent's long context; the agents' decodes resume a
+        few steps later."""
+        if not self.decode_hold_tokens:
+            return None
+        return min(
+            (
+                req.priority
+                for req in self.running
+                if req.num_output_tokens
+                + cdiv(req.num_output_placeholders, 1 + self.num_spec_tokens)
+                < self.decode_hold_tokens
+            ),
+            default=None,
+        )
 
     def _waiting_request_holds(
         self,

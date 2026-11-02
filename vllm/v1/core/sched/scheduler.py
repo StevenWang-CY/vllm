@@ -415,9 +415,9 @@ class Scheduler(SchedulerInterface):
             self._max_growth_blocks = len(managers)
         self.priority_prefill_budget_cap = make_room["budget_cap"]
         self.priority_prefill_budget_cap_tokens = make_room["budget_cap_tokens"]
-        # With the budget cap, a request leaves free only the reservations of
-        # in-flight prefills of its priority or a higher one: see
-        # _reservation_priority.
+        # With take_reservations (which needs the budget cap), a request leaves
+        # free only the reservations of in-flight prefills of its priority or a
+        # higher one: see _reservation_priority.
         self.take_reservations = make_room["take_reservations"]
         # The step in which each in-flight KV load was first seen, and the steps
         # each waiting request has held lower-priority prefill back: either

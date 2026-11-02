@@ -470,6 +470,10 @@ class Scheduler(SchedulerInterface):
             self._max_growth_blocks = len(managers)
         self.priority_prefill_budget_cap = make_room["budget_cap"]
         self.priority_prefill_budget_cap_tokens = make_room["budget_cap_tokens"]
+        # With the budget cap, a request leaves free only the reservations of
+        # in-flight prefills of its priority or a higher one: see
+        # _reservation_priority.
+        self.take_reservations = make_room["take_reservations"]
         # The step in which each in-flight KV load was first seen, and the steps
         # each waiting request has held lower-priority prefill back: either
         # holds for priority_prefill_budget_cap_tokens steps only.
@@ -1692,7 +1696,9 @@ class Scheduler(SchedulerInterface):
                     # plus its own spec decode step blocks, to avoid deadlock and
                     # predictable preemptions.
                     reserved_blocks = (
-                        self._inflight_prefill_reserved_blocks()
+                        self._inflight_prefill_reserved_blocks(
+                            self._reservation_priority(request)
+                        )
                         + self._spec_decode_step_blocks
                     )
 
@@ -3709,11 +3715,25 @@ class Scheduler(SchedulerInterface):
                 kv_fetch_stages[request] = stage
                 self._kv_fetch_counts[stage] += 1
 
-    def _inflight_prefill_reserved_blocks(self) -> int:
-        """Num blocks in-flight prefills still need to finish (their reservation)."""
+    def _inflight_prefill_reserved_blocks(self, priority: int | None = None) -> int:
+        """Num blocks in-flight prefills still need to finish (their reservation),
+        or with `priority`, those of in-flight prefills of that priority or a
+        higher one (a lower value)."""
         return sum(
-            self._request_remaining_blocks(req) for req in self._inflight_prefills
+            self._request_remaining_blocks(req)
+            for req in self._inflight_prefills
+            if priority is None or req.priority <= priority
         )
+
+    def _reservation_priority(self, request: Request) -> int | None:
+        """The in-flight prefills whose reservations `request` leaves free when
+        admitted: with take_reservations, those of its priority or a higher one,
+        as `_inflight_prefill_reserved_blocks(priority)` takes it, since the
+        budget cap holds the lower ones' prefill back in the step it is admitted
+        in; otherwise all of them (None). A lower-priority agent's long prefill,
+        or its load from the CPU tier, then no longer keeps a call waiting for
+        the thousand blocks it will need later."""
+        return request.priority if self.take_reservations else None
 
     def _make_room_switches(self, make_room: Any) -> dict[str, Any]:
         """make_room's switches, from --additional-config's make_room table,
@@ -3727,17 +3747,18 @@ class Scheduler(SchedulerInterface):
             "retain_s": 30,
             "recompute_tokens": 0,
             "hint_hold_ms": 0,
+            "take_reservations": False,
         }
         if not isinstance(make_room, dict):
             raise ValueError(f"make_room must be a table, not {make_room!r}")
         for key, value in make_room.items():
-            if key == "budget_cap":
+            if key in ("budget_cap", "take_reservations"):
                 flag = {"true": True, "1": True, "false": False, "0": False}.get(
                     str(value).lower()
                 )
                 if flag is None:
                     raise ValueError(
-                        f"make_room.budget_cap must be true or false, not {value!r}"
+                        f"make_room.{key} must be true or false, not {value!r}"
                     )
                 switches[key] = flag
             elif key in switches:
@@ -3763,8 +3784,14 @@ class Scheduler(SchedulerInterface):
             or switches["retain_tokens"]
             or switches["recompute_tokens"]
             or switches["hint_hold_ms"]
+            or switches["take_reservations"]
         ):
             raise ValueError("make_room needs --scheduling-policy priority")
+        if switches["take_reservations"] and not switches["budget_cap"]:
+            raise ValueError(
+                "make_room.take_reservations needs make_room.budget_cap, which "
+                "holds the lower priorities' prefill back meanwhile"
+            )
         return switches
 
     def _retain(self, request: Request) -> None:
@@ -4130,7 +4157,10 @@ class Scheduler(SchedulerInterface):
         if (
             num_blocks_short > 0
             and not self.need_mamba_block_aligned_split
-            and num_blocks_short > self._num_released_blocks(candidates, hit)
+            and num_blocks_short
+            > self._num_released_blocks(
+                candidates, hit, self._reservation_priority(request)
+            )
         ):
             # Even every candidate would not make room, and the decodes' growth
             # only adds to the shortfall. (Not in Mamba's align mode, where the
@@ -4161,7 +4191,9 @@ class Scheduler(SchedulerInterface):
         for victim in candidates:
             victims.append(victim)
             num_blocks_short -= self._num_growth_blocks(victim, num_steps)
-            if num_blocks_short <= self._num_released_blocks(victims, hit):
+            if num_blocks_short <= self._num_released_blocks(
+                victims, hit, self._reservation_priority(request)
+            ):
                 break
         else:
             return set()
@@ -4182,9 +4214,12 @@ class Scheduler(SchedulerInterface):
         """The free blocks the waiting `request` lacks to be admitted with its
         whole remaining sequence, net of its prefix cache hit `hit`, beside the
         watermark and what in-flight prefills still need (as an async KV load
-        is admitted) and, with a positive priority value, the reserve. Zero or
-        less when it fits."""
-        num_blocks = self._inflight_prefill_reserved_blocks()
+        is admitted; with take_reservations, only those of its priority or a
+        higher one: see _reservation_priority) and, with a positive priority
+        value, the reserve. Zero or less when it fits."""
+        num_blocks = self._inflight_prefill_reserved_blocks(
+            self._reservation_priority(request)
+        )
         if request not in self._inflight_prefills:
             num_blocks += self._make_room_remaining_blocks(request, hit)
         if self.running:
@@ -4257,12 +4292,14 @@ class Scheduler(SchedulerInterface):
         self,
         victims: list[Request],
         hit: tuple[tuple[list[KVCacheBlock], ...], int] | None,
+        priority: int | None = None,
     ) -> int:
         """The blocks back in the free pool by the next step once `victims` are
         preempted: those whose every holder is a victim or a deferred free,
         except the blocks of the prefix cache hit `hit`, which the waiting
         request takes, plus the blocks in-flight prefills among `victims` still
-        reserve."""
+        reserve, of the reservations the request leaves free (`priority`, as
+        _reservation_priority gives it)."""
         if not victims and not self.deferred_frees:
             return 0
         hit_blocks = set() if hit is None else {id(b) for g in hit[0] for b in g}
@@ -4297,6 +4334,7 @@ class Scheduler(SchedulerInterface):
             self._request_remaining_blocks(req)
             for req in victims
             if req in self._inflight_prefills
+            and (priority is None or req.priority <= priority)
         )
 
     def _load_restores_replay_window(self, request: Request) -> bool:

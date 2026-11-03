@@ -82,6 +82,8 @@ def create_scheduler(
     runner: RunnerOption = "auto",
     per_request_spec_decode_metrics: str = "none",
     scheduling_policy: SchedulerPolicy = "fcfs",
+    watermark: float = 0.0,
+    max_priority_preemptions_per_step: int = 0,
     diffusion_canvas_length: int | None = None,
     scheduler_cls: type[Scheduler] | None = None,
 ) -> Scheduler | AsyncScheduler:
@@ -130,9 +132,10 @@ def create_scheduler(
         enable_chunked_prefill=enable_chunked_prefill,
         async_scheduling=async_scheduling,
         is_encoder_decoder=model_config.is_encoder_decoder,
-        # Ensure admission/preemption mechanics are deterministic
-        watermark=0.0,
+        # 0.0 by default, so admission/preemption mechanics are deterministic
+        watermark=watermark,
         policy=scheduling_policy,
+        max_priority_preemptions_per_step=max_priority_preemptions_per_step,
     )
     # Cache config, optionally force APC
     cache_config = CacheConfig(
